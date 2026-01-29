@@ -82,10 +82,6 @@ func (o *options) devicePluginForResource(ctx context.Context, resourceManager r
 		return nil, err
 	}
 
-	// Initialize health context at construction time to eliminate race condition
-	// where ListAndWatch() might access healthCtx before initialize() completes.
-	healthCtx, healthCancel := context.WithCancel(ctx)
-
 	plugin := nvidiaDevicePlugin{
 		ctx:                  ctx,
 		rm:                   resourceManager,
@@ -102,12 +98,10 @@ func (o *options) devicePluginForResource(ctx context.Context, resourceManager r
 		socket: getPluginSocketPath(resourceManager.Resource()),
 		// These will be reinitialized every
 		// time the plugin server is restarted.
-		server: nil,
-		health: nil,
-
-		// Health context initialized at construction to prevent race conditions
-		healthCtx:    healthCtx,
-		healthCancel: healthCancel,
+		server:       nil,
+		health:       nil,
+		healthCtx:    nil,
+		healthCancel: nil,
 	}
 	return &plugin, nil
 }
@@ -119,32 +113,6 @@ func getPluginSocketPath(resource spec.ResourceName) string {
 	return filepath.Join(pluginapi.DevicePluginPath, pluginName) + ".sock"
 }
 
-func (plugin *nvidiaDevicePlugin) initialize() {
-	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
-	plugin.health = make(chan *rm.Device)
-	// healthCtx and healthCancel already initialized at construction time
-}
-
-func (plugin *nvidiaDevicePlugin) cleanup() {
-	if plugin.healthCancel != nil {
-		plugin.healthCancel()
-		// Recreate context for potential plugin restart. The same plugin instance
-		// may be restarted via Start() after Stop(), so we need a fresh context.
-		plugin.healthCtx, plugin.healthCancel = context.WithCancel(plugin.ctx)
-	}
-	plugin.healthWg.Wait()
-
-	// Close health channel before niling to prevent panics in ListAndWatch()
-	if plugin.health != nil {
-		close(plugin.health)
-	}
-
-	plugin.server = nil
-	plugin.health = nil
-	// Do not nil healthCtx or healthCancel - they are needed for restart
-	// and are recreated above if they were cancelled
-}
-
 // Devices returns the full set of devices associated with the plugin.
 func (plugin *nvidiaDevicePlugin) Devices() rm.Devices {
 	return plugin.rm.Devices()
@@ -153,8 +121,6 @@ func (plugin *nvidiaDevicePlugin) Devices() rm.Devices {
 // Start starts the gRPC server, registers the device plugin with the Kubelet,
 // and starts the device healthchecks.
 func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
-	plugin.initialize()
-
 	if err := plugin.mps.waitForDaemon(); err != nil {
 		return fmt.Errorf("error waiting for MPS daemon: %w", err)
 	}
@@ -162,7 +128,6 @@ func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	err := plugin.Serve()
 	if err != nil {
 		klog.Errorf("Could not start device plugin for '%s': %s", plugin.rm.Resource(), err)
-		plugin.cleanup()
 		return err
 	}
 	klog.Infof("Starting to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
@@ -174,6 +139,8 @@ func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	}
 	klog.Infof("Registered device plugin for '%s' with Kubelet", plugin.rm.Resource())
 
+	plugin.health = make(chan *rm.Device)
+	plugin.healthCtx, plugin.healthCancel = context.WithCancel(plugin.ctx)
 	plugin.healthWg.Add(1)
 	go func() {
 		defer plugin.healthWg.Done()
@@ -197,12 +164,18 @@ func (plugin *nvidiaDevicePlugin) Stop() error {
 	if plugin == nil || plugin.server == nil {
 		return nil
 	}
+	// We stop the health checks
+	plugin.healthCancel()
+	plugin.healthWg.Wait()
+	// Close the health channel after waiting for the health check goroutine to terminate.
+	close(plugin.health)
+
 	klog.Infof("Stopping to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
 	plugin.server.Stop()
+	plugin.server = nil
 	if err := os.Remove(plugin.socket); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	plugin.cleanup()
 	return nil
 }
 
@@ -214,6 +187,7 @@ func (plugin *nvidiaDevicePlugin) Serve() error {
 		return err
 	}
 
+	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
 	pluginapi.RegisterDevicePluginServer(plugin.server, plugin)
 
 	go func() {
@@ -298,19 +272,15 @@ func (plugin *nvidiaDevicePlugin) GetDevicePluginOptions(context.Context, *plugi
 
 // ListAndWatch lists devices and update that list according to the health status
 func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
-	// Capture references at start to avoid race with cleanup() which may nil these fields.
-	healthCtx := plugin.healthCtx
-	health := plugin.health
-
 	if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
 		return err
 	}
 
 	for {
 		select {
-		case <-healthCtx.Done():
+		case <-plugin.healthCtx.Done():
 			return nil
-		case d, ok := <-health:
+		case d, ok := <-plugin.health:
 			if !ok {
 				// Health channel closed, health checks stopped
 				return nil
