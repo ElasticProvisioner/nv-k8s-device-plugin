@@ -65,10 +65,10 @@ type nvidiaDevicePlugin struct {
 	health chan *rm.Device
 
 	// healthCtx and healthCancel control the health check goroutine lifecycle.
-	// healthWg is used to wait for the health check goroutine to complete during cleanup.
 	healthCtx    context.Context
 	healthCancel context.CancelFunc
-	healthWg     sync.WaitGroup
+	// healthWg is used to wait for the health check goroutine to complete during cleanup.
+	healthWg sync.WaitGroup
 
 	imexChannels imex.Channels
 
